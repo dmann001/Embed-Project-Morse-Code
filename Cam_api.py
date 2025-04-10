@@ -7,187 +7,147 @@ import mimetypes
 import anthropic
 from PIL import Image
 
-# Configuration
-ESP32_PORT = 'COM7' 
+ESP32_PORT = 'COM7'
 ESP32_BAUDRATE = 115200
-ESP32_TIMEOUT = 10
-CLAUDE_API_KEY = "API-KEY"  
+ESP32_TIMEOUT = 20
+
+K66F_PORT = 'COM3'
+K66F_BAUDRATE = 9600
+
+CLAUDE_API_KEY = "API-KEY"
 CLAUDE_MODEL = "claude-3-7-sonnet-20250219"
+
 OUTPUT_DIR = "captured_images"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initialize Serial connection
-ser = serial.Serial(ESP32_PORT, baudrate=ESP32_BAUDRATE, timeout=ESP32_TIMEOUT)
+esp32_ser = serial.Serial(ESP32_PORT, ESP32_BAUDRATE, timeout=ESP32_TIMEOUT)
+k66f_ser = serial.Serial(K66F_PORT, K66F_BAUDRATE, timeout=2)
 
-# Initialize Anthropic client
 client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 
 def capture_image_from_esp32():
-    """Captures an image from ESP32-CAM and returns the processed image"""
     try:
-        # Wait for start marker
         line = ""
+        print("Waiting for START_IMAGE...")
         while "START_IMAGE" not in line:
-            line = ser.readline().decode(errors='ignore').strip()
-            print(f"Received line: {line}")
+            line = esp32_ser.readline().decode(errors='ignore').strip()
+            print(f"ESP32: {line}")
 
-        print("Start marker detected")
-
-        # Get size of image
-        size_line = ser.readline().decode(errors='ignore').strip()
-        print(f"Size line: {size_line}")
+        size_line = esp32_ser.readline().decode(errors='ignore').strip()
+        print(f"ESP32: {size_line}")
 
         if not size_line.startswith("SIZE:"):
-            print("Invalid size marker - skipping")
+            print("Invalid SIZE marker.")
             return None
 
         size = int(size_line.split(":")[1])
-        print(f"Image size: {size} bytes")
+        print(f"Receiving image of {size} bytes.")
 
-        # Read exact number of bytes for the image data
         image_data = bytearray()
         while len(image_data) < size:
-            chunk = ser.read(size - len(image_data))
+            chunk = esp32_ser.read(size - len(image_data))
             if not chunk:
-                raise Exception("Timeout while reading image data")
+                raise TimeoutError("Timeout receiving image data.")
             image_data.extend(chunk)
 
-        print(f"Received {len(image_data)} bytes of image data")
+        print("Image data received.")
 
-        # Verify end marker
-        end_line = ""
-        while "END_IMAGE" not in end_line:
-            end_line = ser.readline().decode(errors='ignore').strip()
-            print(f"End line: {end_line}")
+        end_line = esp32_ser.readline().decode(errors='ignore').strip()
+        print(f"ESP32: {end_line}")
 
-        if "END_IMAGE" not in end_line:
-            print("Corrupted image - discarding")
+        if end_line != "END_IMAGE":
+            print("Missing END_IMAGE marker.")
             return None
 
-        # Open and process the image using Pillow
         img = Image.open(io.BytesIO(image_data))
-        
-        # Apply mirror (horizontal flip) and rotate 180°
         img_processed = img.transpose(Image.FLIP_LEFT_RIGHT).rotate(180)
-        
-        # Save the processed image
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
-        filename = os.path.join(OUTPUT_DIR, f"image_{timestamp}.jpg")
+        filename = os.path.join(OUTPUT_DIR, f"image_{time.strftime('%Y%m%d_%H%M%S')}.jpg")
         img_processed.save(filename)
-        print(f"Saved: {filename}")
-        
+        print(f"Image saved: {filename}")
         return filename
-    
+
     except Exception as e:
-        print(f"Error during image capture: {str(e)}")
+        print(f"Error capturing image: {e}")
         return None
     finally:
-        # Clear residual data in serial buffer
-        ser.reset_input_buffer()
+        esp32_ser.reset_input_buffer()
 
 def encode_image(image_path):
-    """Encodes image to base64 and detects media type"""
     mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type not in ["image/jpeg", "image/png"]:
-        print(f"Warning: Unexpected mime type {mime_type}, defaulting to image/jpeg")
-        mime_type = "image/jpeg"
-    
-    with open(image_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    
-    return encoded_string, mime_type
+    with open(image_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode()
+    return encoded, mime_type or "image/jpeg"
 
 def analyze_with_claude(image_path):
-    """Sends image to Claude API with a fixed prompt and returns the response"""
+    image_base64, media_type = encode_image(image_path)
+    prompt = (
+                              "detect the morse code dots(black filled circles) and dashes(black filled rectangles)--> print them from left to right line by line."
+
+    )
+
+    message = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    )
+
+    return message.content[0].text.strip() if message.content else "No response"
+
+def extract_clean_message(raw_analysis: str) -> str:
+    prompt = (
+         "USE INTERNATIONAL MORSE CODE-->convert the following picture morse code into english letters. Read from Left to right and each line should be read as single english letter-ONLY use international morse code only. Dont hallucinate. Each row is a english letter. Lets say Line 1: Dash, Dot, Dot --> it would be translated as D "
+    "in plain English (like 'SOS'), OR a short scene description (under 80 characters).\n"
+    "Do not explain. Do not include labels. Just return the clean final text.\n\n"
+    f"{raw_analysis}"
+    )
+
     try:
-        image_base64, media_type = encode_image(image_path)
-
-        # Hardcoded prompt for analysis
-        prompt_text = (
-            "convert the following picture morse code into english letters. Interpret small squares as dots (.) and larger rectangles as dashes (-). Further use international morse code only. Dont hallucinate. Each row is a english letter."
-        )
-
-        # Create API request
         message = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,  # Adjust based on expected response length
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_base64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt_text,  # Hardcoded prompt
-                        },
-                    ],
-                }
-            ],
+            max_tokens=50,
+            messages=[{
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}]
+            }]
         )
-
-        # Return Claude's response
-        return message.content[0].text if message.content else "Error: No response received"
-
+        return message.content[0].text.strip() if message.content else "UNKNOWN"
     except Exception as e:
-        print(f"Error analyzing image with Claude: {str(e)}")
-        return f"Error: {str(e)}"
+        print(f"Error extracting clean message: {e}")
+        return "ERROR"
 
+def send_to_k66f(message):
+    message = message.strip() + "\n"
+    k66f_ser.write(message.encode('utf-8'))
+    print(f"Sent to K66F: {message.strip()}")
 
 def main():
-    print("ESP32-CAM Image Capture and Claude Analysis System")
-    print("Press Ctrl+C to exit")
-    
-    # Default prompt for Claude (can be customized)
-    default_prompt = "Describe what you see in this image in detail."
-    
+    print("Morse Code Image Translator System Running...")
     try:
         while True:
-            print("\n1. Capture image and analyze")
-            print("2. Change analysis prompt")
-            print("3. Exit")
-            choice = input("Select an option (1-3): ")
-            
-            if choice == "1":
-                print("Capturing image from ESP32-CAM...")
-                image_path = capture_image_from_esp32()
-                
-                if image_path:
-                    print(f"Image captured and saved to {image_path}")
-                    print("Sending to Claude API for analysis...")
-                    
-                    response = analyze_with_claude(image_path)
-                    print("\nClaude's Analysis:")
-                    print(response)
-                else:
-                    print("Failed to capture image")
-            
-            elif choice == "2":
-                new_prompt = input("Enter new prompt for Claude: ")
-                if new_prompt:
-                    default_prompt = new_prompt
-                    print(f"Prompt updated to: {default_prompt}")
-            
-            elif choice == "3":
-                print("Exiting program...")
-                break
-            
+            image_path = capture_image_from_esp32()
+            if image_path:
+                raw_result = analyze_with_claude(image_path)
+                print(f"Claude API Result (Raw):\n{raw_result}")
+
+                clean_result = extract_clean_message(raw_result)
+                print(f"Final Decoded Message: {clean_result}")
+
+                send_to_k66f(clean_result)
             else:
-                print("Invalid option, please try again")
-    
+                print("Image capture failed. Retrying...")
+            time.sleep(5)
     except KeyboardInterrupt:
-        print("\nProgram terminated by user")
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print("Stopped by user.")
     finally:
-        ser.close()
-        print("Serial port closed")
+        esp32_ser.close()
+        k66f_ser.close()
+        print("Serial connections closed.")
 
 if __name__ == "__main__":
     main()
